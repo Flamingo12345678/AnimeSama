@@ -17,6 +17,32 @@ pub struct AnimeDetails {
     pub seasons: Vec<AnimeSeason>,
 }
 
+
+// Ne pas prendre pour des saisons les exemples de code
+// situés dans les commentaires JavaScript /* ... */.
+fn active_panel_captures<'a>(
+    html: &'a str,
+    pattern: &Regex,
+) -> Vec<regex::Captures<'a>> {
+    let comments: Vec<(usize, usize)> =
+        Regex::new(r"(?s)/\*.*?\*/")
+            .unwrap()
+            .find_iter(html)
+            .map(|m| (m.start(), m.end()))
+            .collect();
+
+    pattern
+        .captures_iter(html)
+        .filter(|cap| {
+            let start = cap.get(0).unwrap().start();
+
+            !comments.iter().any(|&(begin, end)| {
+                start >= begin && start < end
+            })
+        })
+        .collect()
+}
+
 pub fn fetch_anime_details(slug: &str) -> Result<AnimeDetails, String> {
     let clean_slug = slug.trim().trim_matches('/');
 
@@ -74,7 +100,7 @@ pub fn fetch_anime_details(slug: &str) -> Result<AnimeDetails, String> {
     let mut seasons: Vec<AnimeSeason> = Vec::new();
     let mut seen_paths = std::collections::HashSet::new();
 
-    for cap in season_re.captures_iter(&html) {
+    for cap in active_panel_captures(&html, &season_re) {
         let name = cap[1].trim().to_string();
         let path = cap[2].trim().trim_matches('/').to_string();
 
@@ -87,7 +113,7 @@ pub fn fetch_anime_details(slug: &str) -> Result<AnimeDetails, String> {
         }
     }
 
-    for cap in scan_re.captures_iter(&html) {
+    for cap in active_panel_captures(&html, &scan_re) {
         let name = cap[1].trim().to_string();
         let path = cap[2].trim().trim_matches('/').to_string();
 
@@ -122,4 +148,67 @@ pub fn fetch_anime_details(slug: &str) -> Result<AnimeDetails, String> {
     };
 
     Ok(details)
+}
+
+
+#[cfg(test)]
+mod panel_comment_filter_tests {
+    use super::*;
+
+    fn parse(html: &str, kind: &str) -> Vec<(String, String)> {
+        let pattern = Regex::new(&format!(
+            r#"panneau{}\(\s*["']([^"']+)["']\s*,\s*["']([^"']+)["']\s*\)"#,
+            kind
+        )).unwrap();
+
+        active_panel_captures(html, &pattern)
+            .iter()
+            .map(|cap| (
+                cap[1].to_string(),
+                cap[2].to_string()
+            ))
+            .collect()
+    }
+
+    #[test]
+    fn ignores_commented_seasons() {
+        let html = r#"
+            panneauAnime("Saison 1", "saison1/vostfr");
+            /*
+            panneauAnime("Saison 2", "saison2/vostfr");
+            panneauAnime("Film", "film/vostfr");
+            */
+        "#;
+
+        assert_eq!(
+            parse(html, "Anime"),
+            vec![(
+                "Saison 1".into(),
+                "saison1/vostfr".into()
+            )]
+        );
+    }
+
+    #[test]
+    fn keeps_real_multiple_seasons() {
+        let html = r#"
+            panneauAnime("Saison 1", "saison1/vostfr");
+            panneauAnime("Saison 2", "saison2/vostfr");
+        "#;
+
+        assert_eq!(parse(html, "Anime").len(), 2);
+    }
+
+    #[test]
+    fn keeps_scans_outside_comments() {
+        let html = r#"
+            /* panneauScan("nom", "url"); */
+            panneauScan("Scans", "scan/vf");
+        "#;
+
+        assert_eq!(
+            parse(html, "Scan"),
+            vec![("Scans".into(), "scan/vf".into())]
+        );
+    }
 }
