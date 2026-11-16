@@ -172,13 +172,21 @@ pub fn fetch_following_redirects(
     max_js_hops: u8,
     range: Option<&str>,
 ) -> Result<FetchResult, FetchError> {
-    let agent = ureq::AgentBuilder::new()
-        .redirects(0)
-        .https_only(true)
-        .try_proxy_from_env(false)
-        .timeout(Duration::from_secs(20))
-        .resolver(resolve_public_addresses)
-        .build();
+    // Cataclyse 12.0.6A.2 : pool HTTP partagé.
+    static PROXY_AGENT: std::sync::OnceLock<ureq::Agent> =
+        std::sync::OnceLock::new();
+
+    let agent = PROXY_AGENT.get_or_init(|| {
+        ureq::AgentBuilder::new()
+            .redirects(0)
+            .https_only(true)
+            .try_proxy_from_env(false)
+            .timeout(Duration::from_secs(20))
+            .resolver(resolve_public_addresses)
+            .max_idle_connections(32)
+            .max_idle_connections_per_host(4)
+            .build()
+    });
 
     let js_redirect_re = Regex::new(r#"window\.location\.href\s*=\s*['"]([^'"]+)['"]"#).unwrap();
 
