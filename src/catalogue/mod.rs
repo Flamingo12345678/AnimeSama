@@ -75,6 +75,56 @@ impl CatalogData {
             data.sections.len(),
             data.slides.len()
         );
+        let mut data = data;
+
+        if let Some(path) = std::env::var_os(
+            "CATACLYSE_CATALOGUE_SNAPSHOT"
+        ) {
+            let metadata = std::fs::metadata(&path)
+                .map_err(|e| format!("Snapshot inaccessible : {e}"))?;
+
+            if !metadata.is_file() || metadata.len() > 8_000_000 {
+                return Err("Snapshot catalogue invalide".into());
+            }
+
+            let raw = std::fs::read(&path)
+                .map_err(|e| format!("Lecture snapshot : {e}"))?;
+
+            let cards: Vec<CardItem> = serde_json::from_slice(&raw)
+                .map_err(|e| format!("JSON catalogue : {e}"))?;
+
+            if !(2000..=20000).contains(&cards.len()) {
+                return Err("Taille du catalogue inattendue".into());
+            }
+
+            let mut seen = std::collections::HashSet::new();
+
+            for card in &cards {
+                if card.slug.is_empty()
+                    || card.slug.len() > 256
+                    || card.slug == "."
+                    || card.slug.contains("..")
+                    || !card.slug.chars().all(|c| {
+                        c.is_alphanumeric()
+                            || matches!(c, '-' | '_' | '.')
+                    })
+                    || card.nom.trim().is_empty()
+                    || !seen.insert(card.slug.as_str())
+                {
+                    return Err(
+                        "Slug dupliqué ou fiche invalide".into()
+                    );
+                }
+            }
+
+            println!(
+                "[Catalogue] Snapshot validé : {} œuvres",
+                cards.len()
+            );
+
+            data.catalogue = cards;
+        }
+
         Ok(data)
     }
 

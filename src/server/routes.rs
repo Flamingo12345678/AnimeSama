@@ -512,6 +512,31 @@ pub fn handle_request(mut req: tiny_http::Request, state: Arc<AppState>) {
                 return;
             }
 
+            if std::env::var_os(
+                "CATACLYSE_CATALOGUE_SNAPSHOT"
+            ).is_some() {
+                let query = q.trim().to_lowercase();
+
+                let results: Vec<_> = state.catalog.catalogue
+                    .iter()
+                    .filter(|card| {
+                        card.nom.to_lowercase().contains(&query)
+                            || card.slug.to_lowercase().contains(&query)
+                            || card.genres.iter().any(|genre| {
+                                genre.to_lowercase().contains(&query)
+                            })
+                    })
+                    .cloned()
+                    .collect();
+
+                respond_json(req, &json!({
+                    "query": q,
+                    "count": results.len(),
+                    "results": results
+                }).to_string());
+                return;
+            }
+
             match state.scraper.search_live(&q) {
                 Ok(results) => {
                     let body = json!({
