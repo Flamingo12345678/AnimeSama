@@ -53,6 +53,7 @@ fn validate_site_url(input: &str) -> Result<url::Url, String> {
     if url.path() != "/"
         && !url.path().starts_with("/catalogue/")
         && url.path() != "/s2/scans/get_nb_chap_et_img.php"
+        && url.path() != "/api/lien.php"
     {
         return Err("Chemin distant non autorisé".to_string());
     }

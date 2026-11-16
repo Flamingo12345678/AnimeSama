@@ -26,6 +26,66 @@ pub struct SeasonEpisodes {
     pub available_languages: Vec<String>,
     #[serde(default)]
     pub scan_data: Option<ScanData>,
+    #[serde(default)]
+    pub jeton: Option<String>,
+}
+
+
+/// Résout une référence d'épisode auprès d'Anime-Sama.
+/// Ne journalise ni le jeton ni l'URL de lecture.
+pub fn resolve_lien(
+    jeton: &str,
+    id: &str,
+    slug: &str,
+    season: &str,
+) -> Result<String, String> {
+    if id.is_empty()
+        || id.len() > 20
+        || !id.bytes().all(|b| b.is_ascii_digit())
+        || jeton.is_empty()
+        || jeton.len() > 256
+        || !super::http::valid_slug(slug)
+        || !super::http::valid_season_path(season)
+    {
+        return Err("Paramètres de résolution invalides".to_string());
+    }
+
+    let endpoint = format!(
+        "https://anime-sama.to/api/lien.php?j={}&l={}",
+        url_encode(jeton),
+        url_encode(id)
+    );
+
+    let referer = format!(
+        "https://anime-sama.to/catalogue/{}/{}/",
+        slug, season
+    );
+
+    let body = super::http::fetch_site_text(
+        &endpoint,
+        8,
+        16 * 1024,
+        Some(&referer),
+    )
+    .map_err(|_| "Résolution distante indisponible".to_string())?;
+
+    let result: serde_json::Value =
+        serde_json::from_str(&body)
+            .map_err(|_| "Réponse de résolution invalide".to_string())?;
+
+    let url = result
+        .get("u")
+        .and_then(|value| value.as_str())
+        .ok_or_else(|| "Lien vidéo absent".to_string())?;
+
+    if url.is_empty() || url.len() > 4096 {
+        return Err("Lien vidéo invalide".to_string());
+    }
+
+    crate::proxy::security::validate_proxy_url(url)
+        .map_err(|_| "Destination vidéo non autorisée".to_string())?;
+
+    Ok(url.to_string())
 }
 
 pub fn url_encode(input: &str) -> String {
@@ -205,6 +265,7 @@ pub fn fetch_scan_episodes(slug: &str, season_path: &str) -> Result<SeasonEpisod
             total_chapters,
             chapters,
         }),
+        jeton: None,
     })
 }
 
@@ -260,15 +321,36 @@ pub fn fetch_episodes(slug: &str, season_path: &str) -> Result<SeasonEpisodes, S
         langs
     });
 
-    let resp = super::http::fetch_site_text(
-        &ep_url,
+    let mut actual_season = clean_season.clone();
+
+    // v0.1.36 : les tableaux epsN peuvent être
+    // intégrés directement dans la page HTML.
+    let page_html = super::http::fetch_site_text(
+        &base_url,
         8,
         4 * 1024 * 1024,
-        Some(&base_url),
-    );
+        Some("https://anime-sama.to/"),
+    )
+    .ok()
+    .filter(|html| {
+        Regex::new(
+            r"(?:var|let|const)\s+eps[0-9]+\s*=\s*\["
+        )
+        .unwrap()
+        .is_match(html)
+    });
 
-    let mut actual_season = clean_season.clone();
-    let js = match resp {
+    let js = if let Some(html) = page_html {
+        html
+    } else {
+        let resp = super::http::fetch_site_text(
+            &ep_url,
+            8,
+            4 * 1024 * 1024,
+            Some(&base_url),
+        );
+
+        match resp {
         Ok(js) => js,
         Err(_) => {
             let season_base = clean_season.split('/').next().unwrap_or("saison1");
@@ -310,7 +392,15 @@ pub fn fetch_episodes(slug: &str, season_path: &str) -> Result<SeasonEpisodes, S
                 }
             }
         }
+        }
     };
+
+    let jeton = Regex::new(
+        r#"epsJeton\s*=\s*["']([^"']+)["']"#
+    )
+    .unwrap()
+    .captures(&js)
+    .map(|capture| capture[1].to_string());
 
     let array_re = Regex::new(r#"(?:var|let|const)\s+([a-zA-Z0-9_]+)\s*=\s*\[([^\]]*)\]"#).unwrap();
     let str_re = Regex::new(r#"['"]([^'"]+)['"]"#).unwrap();
@@ -379,6 +469,7 @@ pub fn fetch_episodes(slug: &str, season_path: &str) -> Result<SeasonEpisodes, S
         players,
         available_languages,
         scan_data: None,
+        jeton,
     };
 
     Ok(season_episodes)

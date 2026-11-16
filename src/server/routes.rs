@@ -631,6 +631,80 @@ pub fn handle_request(mut req: tiny_http::Request, state: Arc<AppState>) {
             }
         }
 
+
+        ("GET", "/api/lien") => {
+            let slug = query_params
+                .get("slug").cloned().unwrap_or_default();
+            let season = query_params
+                .get("season").cloned().unwrap_or_default();
+            let id = query_params
+                .get("l").cloned().unwrap_or_default();
+
+            if !crate::scraper::valid_episode_request(&slug, &season)
+                || id.is_empty()
+                || id.len() > 20
+                || !id.bytes().all(|b| b.is_ascii_digit())
+            {
+                respond_error(req, 400, "Paramètres invalides");
+                return;
+            }
+
+            let episodes = match state.scraper.get_episodes(
+                &slug, &season
+            ) {
+                Ok(episodes) => episodes,
+                Err(_) => {
+                    respond_error(
+                        req, 502, "Épisodes indisponibles"
+                    );
+                    return;
+                }
+            };
+
+            let reference = format!("lien:{}", id);
+
+            let belongs_to_season = episodes
+                .players
+                .values()
+                .any(|links| {
+                    links.iter().any(|link| link == &reference)
+                });
+
+            if !belongs_to_season {
+                respond_error(
+                    req, 404, "Référence inconnue pour cette saison"
+                );
+                return;
+            }
+
+            let jeton = match episodes.jeton.as_deref() {
+                Some(value) if !value.is_empty() => value,
+                _ => {
+                    respond_error(req, 502, "Jeton indisponible");
+                    return;
+                }
+            };
+
+            match crate::scraper::episodes::resolve_lien(
+                jeton,
+                &id,
+                &slug,
+                &season,
+            ) {
+                Ok(url) => {
+                    respond_json(
+                        req,
+                        &json!({ "u": url }).to_string()
+                    );
+                }
+                Err(_) => {
+                    respond_error(
+                        req, 502, "Résolution vidéo indisponible"
+                    );
+                }
+            }
+        }
+
         ("GET", "/api/user") => {
             let token = match checked_playback_session(
                 &req,
