@@ -131,9 +131,206 @@ function saveNativeHlsProgress(force = false) {
     );
 }
 
+
+/* Cataclyse 12.0.4 : Native Playback Watchdog */
+
+function catNativeWatchdogReset(state) {
+    state.lastTick = null;
+    state.lastTime = null;
+    state.since = null;
+}
+
+function catNativeWatchdogStep(state, sample) {
+    const {
+        now, position, paused, seeking,
+        ended, hidden, offline, rate,
+        buffer, readyState
+    } = sample;
+
+    // Ne jamais interpréter une pause, un déplacement
+    // ou une suspension iOS comme une panne.
+    if (
+        paused || seeking || ended ||
+        hidden || offline || rate <= 0 ||
+        !Number.isFinite(position)
+    ) {
+        catNativeWatchdogReset(state);
+        return null;
+    }
+
+    // Réinitialiser après un ralentissement des timers
+    // du navigateur ou une sortie de veille.
+    if (
+        state.lastTick === null ||
+        now - state.lastTick > 3500
+    ) {
+        state.lastTick = now;
+        state.lastTime = position;
+        state.since = now;
+        return null;
+    }
+
+    state.lastTick = now;
+
+    const delta = position - state.lastTime;
+
+    if (delta >= 0.2) {
+        state.hasProgress = true;
+        state.lastTime = position;
+        state.since = now;
+        return null;
+    }
+
+    if (delta < -0.2) {
+        state.lastTime = position;
+        state.since = now;
+        return null;
+    }
+
+    const elapsed = now - state.since;
+
+    if (!state.hasProgress) {
+        return elapsed >= 12000
+            ? 'startup-timeout'
+            : null;
+    }
+
+    if (buffer <= 1 && readyState < 3) {
+        return elapsed >= 8000
+            ? 'buffer-starvation'
+            : null;
+    }
+
+    return elapsed >= 15000
+        ? 'playback-frozen'
+        : null;
+}
+
+
+const catNativeWatchdogCleanups = new WeakMap();
+
+function catNativeBufferAhead(video) {
+    try {
+        const time = video.currentTime;
+
+        for (let i = 0; i < video.buffered.length; i++) {
+            const start = video.buffered.start(i);
+            const end = video.buffered.end(i);
+
+            if (time >= start && time <= end) {
+                return Math.max(0, end - time);
+            }
+        }
+    } catch (_) {}
+
+    return 0;
+}
+
+function catStartNativeWatchdog(video, isActive, recover) {
+    const state = {
+        lastTick: null,
+        lastTime: null,
+        since: null,
+        hasProgress: false
+    };
+
+    let stopped = false;
+    let timer = null;
+
+    const reset = () => catNativeWatchdogReset(state);
+
+    const events = [
+        'play',
+        'pause',
+        'seeking',
+        'seeked'
+    ];
+
+    function stop() {
+        if (stopped) return;
+
+        stopped = true;
+        clearInterval(timer);
+
+        events.forEach(event =>
+            video.removeEventListener(event, reset)
+        );
+
+        document.removeEventListener(
+            'visibilitychange', reset
+        );
+
+        window.removeEventListener('online', reset);
+        window.removeEventListener('offline', reset);
+
+        catNativeWatchdogCleanups.delete(video);
+    }
+
+    events.forEach(event =>
+        video.addEventListener(event, reset)
+    );
+
+    document.addEventListener(
+        'visibilitychange', reset
+    );
+
+    window.addEventListener('online', reset);
+    window.addEventListener('offline', reset);
+
+    catNativeWatchdogCleanups.set(video, stop);
+
+    timer = setInterval(() => {
+        if (stopped) return;
+
+        if (!isActive()) {
+            stop();
+            return;
+        }
+
+        const sample = {
+            now: performance.now(),
+            position: video.currentTime,
+            paused: video.paused,
+            seeking: video.seeking,
+            ended: video.ended,
+            hidden: document.visibilityState !== 'visible',
+            offline: navigator.onLine === false,
+            rate: video.playbackRate,
+            buffer: catNativeBufferAhead(video),
+            readyState: video.readyState
+        };
+
+        const reason = catNativeWatchdogStep(
+            state, sample
+        );
+
+        if (!reason) return;
+
+        console.warn(
+            '[Playback Watchdog] Blocage confirmé',
+            {
+                reason,
+                position: sample.position,
+                buffer: sample.buffer,
+                readyState: sample.readyState
+            }
+        );
+
+        stop();
+        recover('watchdog:' + reason);
+
+    }, 1000);
+
+    console.info('[Playback Watchdog] Actif');
+
+    return stop;
+}
+
 function stopNativeHls(save = true) {
     const v = nativeHlsVideo;
     if (!v) return;
+
+    catNativeWatchdogCleanups.get(v)?.();
 
     if (save) saveNativeHlsProgress(true);
 
@@ -144,17 +341,859 @@ function stopNativeHls(save = true) {
     v.remove();
 }
 
+
+/* Cataclyse 12.0.5A : contrôle des sources natives */
+
+function catTakeNativeRetry(session) {
+    if (
+        session.fallbackStarted ||
+        session.launches >= 4
+    ) return false;
+
+    session.launches += 1;
+    return true;
+}
+
+async function catFetchPlaybackJson(
+    input,
+    init = {},
+    isActive,
+    timeoutMs = 12000,
+    fetchImpl = fetch
+) {
+    const controller = new AbortController();
+
+    let reason = null;
+    let timeout = null;
+    let monitor = null;
+
+    const parentSignal = init?.signal;
+
+    function abort(why) {
+        if (controller.signal.aborted) return;
+
+        reason = why;
+        controller.abort();
+    }
+
+    function parentAbort() {
+        abort('parent-aborted');
+    }
+
+    function checkActive() {
+        if (!isActive()) {
+            abort('obsolete-session');
+        }
+    }
+
+    try {
+        checkActive();
+
+        if (parentSignal?.aborted) {
+            parentAbort();
+        }
+
+        if (controller.signal.aborted) {
+            throw new Error(reason);
+        }
+
+        parentSignal?.addEventListener(
+            'abort',
+            parentAbort,
+            { once: true }
+        );
+
+        timeout = setTimeout(
+            () => abort('resolution-timeout'),
+            timeoutMs
+        );
+
+        monitor = setInterval(
+            checkActive,
+            250
+        );
+
+        const response = await fetchImpl(input, {
+            ...init,
+            signal: controller.signal
+        });
+
+        // Le délai couvre aussi la lecture du JSON,
+        // pas seulement la réception des en-têtes.
+        const data = response.ok
+            ? await response.json()
+            : null;
+
+        checkActive();
+
+        if (controller.signal.aborted) {
+            throw new Error(reason);
+        }
+
+        return {
+            ok: response.ok,
+            status: response.status,
+            json: async () => data
+        };
+
+    } catch (error) {
+        if (reason) {
+            const failure = new Error(reason);
+
+            failure.name =
+                reason === 'resolution-timeout'
+                    ? 'TimeoutError'
+                    : 'AbortError';
+
+            throw failure;
+        }
+
+        throw error;
+
+    } finally {
+        clearTimeout(timeout);
+        clearInterval(monitor);
+
+        parentSignal?.removeEventListener(
+            'abort',
+            parentAbort
+        );
+    }
+}
+
+
+/* Cataclyse 12.0.5B : classement et historique des sources */
+
+const catNativeSourceHistory = new Map();
+const CAT_SOURCE_HISTORY_TTL = 30 * 60 * 1000;
+
+function catNativeSourceKey(source) {
+    try {
+        const url = new URL(source.url);
+
+        if (
+            url.protocol !== 'https:' ||
+            url.username ||
+            url.password ||
+            url.port
+        ) return '';
+
+        // Conserver les paramètres du flux.
+        // Ne pas confondre deux ressources différentes.
+        url.hash = '';
+
+        return url.href;
+
+    } catch (_) {
+        return '';
+    }
+}
+
+function catNativeProviderKey(source) {
+    const name = String(
+        source?.provider || source?.host || ''
+    ).trim().toLowerCase();
+
+    return /^[a-z0-9.-]{1,253}$/.test(name)
+        ? name
+        : '';
+}
+
+function catGetSourceStats(source, now = Date.now()) {
+    const key = catNativeProviderKey(source);
+    const stats = catNativeSourceHistory.get(key);
+
+    if (!stats) return null;
+
+    if (now - stats.updatedAt >= CAT_SOURCE_HISTORY_TTL) {
+        catNativeSourceHistory.delete(key);
+        return null;
+    }
+
+    return stats;
+}
+
+function catRememberSourceOutcome(
+    source,
+    success,
+    now = Date.now()
+) {
+    const key = catNativeProviderKey(source);
+
+    if (!key) return;
+
+    const stats = catGetSourceStats(source, now) || {
+        successes: 0,
+        failures: 0
+    };
+
+    if (success) {
+        stats.successes = Math.min(
+            10, stats.successes + 1
+        );
+
+        stats.failures = Math.max(
+            0, stats.failures - 1
+        );
+
+    } else {
+        stats.failures = Math.min(
+            10, stats.failures + 1
+        );
+    }
+
+    stats.updatedAt = now;
+
+    // Historique borné, sans stockage persistant.
+    catNativeSourceHistory.delete(key);
+    catNativeSourceHistory.set(key, stats);
+
+    while (catNativeSourceHistory.size > 32) {
+        const oldest =
+            catNativeSourceHistory.keys().next().value;
+
+        catNativeSourceHistory.delete(oldest);
+    }
+}
+
+function catNativeSourceScore(source, now = Date.now()) {
+    const stats = catGetSourceStats(source, now);
+
+    if (!stats) return 0;
+
+    return (
+        stats.successes * 2 -
+        stats.failures * 4
+    );
+}
+
+function catRankNativeSources(sources) {
+    const now = Date.now();
+
+    const ranked = sources
+        .filter(source => !!catNativeSourceKey(source))
+        .slice()
+        .sort((a, b) => {
+            // Ne pas supprimer la priorité donnée
+            // aux sources vérifiées par le serveur.
+            const health =
+                Number(b.health === 'verified') -
+                Number(a.health === 'verified');
+
+            return health ||
+                catNativeSourceScore(b, now) -
+                catNativeSourceScore(a, now);
+        });
+
+    const seen = new Set();
+
+    return ranked.filter(source => {
+        const key = catNativeSourceKey(source);
+
+        if (seen.has(key)) return false;
+
+        seen.add(key);
+        return true;
+    });
+}
+
+
+/* Cataclyse 12.0.5C.1 : registre des états de lecture */
+
+function catPlaybackTransition(current, generation, phase, patch = {}) {
+    const phases = [
+        'IDLE', 'RESOLVING', 'LOADING',
+        'PLAYING', 'PAUSED', 'BUFFERING',
+        'RECOVERING', 'FALLBACK', 'ERROR',
+        'ENDED'
+    ];
+
+    if (!current || current.generation !== generation) {
+        return null;
+    }
+
+    if (!phases.includes(phase)) return null;
+
+    // Une session terminée ne peut pas être ressuscitée
+    // par un événement tardif.
+    if (
+        ['IDLE', 'ERROR', 'ENDED'].includes(current.phase)
+        && phase !== current.phase
+    ) {
+        return null;
+    }
+
+    return {
+        ...current,
+        ...patch,
+        generation,
+        phase
+    };
+}
+
+
+const CatPlaybackStatus = (() => {
+    let session = null;
+    let guard = null;
+    let retryContext = null;
+    let overlay = null;
+    let label = null;
+    let action = null;
+    let diagnostic = null;
+    let lastRender = 0;
+    let iframePosition = null;
+
+    const messages = {
+        RESOLVING: 'Recherche des sources…',
+        LOADING: 'Chargement de la vidéo…',
+        BUFFERING: 'Mise en mémoire tampon…',
+        RECOVERING: 'Récupération de la lecture…',
+        FALLBACK: 'Chargement du lecteur de secours…',
+        ERROR: 'Impossible de lancer la vidéo'
+    };
+
+    function active(generation) {
+        return !!session &&
+            session.generation === generation &&
+            generation === nativeHlsGeneration &&
+            !!guard?.();
+    }
+
+    function snapshot() {
+        if (!session) return null;
+
+        const video = active(session.generation)
+            ? nativeHlsVideo
+            : null;
+
+        return {
+            generation: session.generation,
+            etat: session.phase,
+            moteur: session.mode || 'indéterminé',
+            fournisseur: session.provider || '—',
+            tentatives: session.attempts || 0,
+            demarrageMs: session.startupMs ?? null,
+            position: Number(
+                (session.position || 0).toFixed(2)
+            ),
+            tampon: video
+                ? Number(
+                    catNativeBufferAhead(video).toFixed(2)
+                )
+                : null,
+            readyState: video?.readyState ?? null,
+            networkState: video?.networkState ?? null,
+            reseau: navigator.onLine ? 'connecté' : 'hors ligne',
+            incident: session.reason || null
+        };
+    }
+
+    function createUI() {
+        const container = document.getElementById(
+            'netflixPlayerContainer'
+        );
+
+        if (!overlay && container) {
+            overlay = document.createElement('div');
+            overlay.id = 'catPlaybackStatusOverlay';
+
+            overlay.style.cssText = `
+                position:absolute;
+                left:50%;
+                top:50%;
+                transform:translate(-50%,-50%);
+                z-index:45;
+                width:max-content;
+                max-width:85%;
+                box-sizing:border-box;
+                padding:14px 20px;
+                border-radius:12px;
+                background:rgba(0,0,0,.84);
+                color:white;
+                text-align:center;
+                pointer-events:none;
+                display:none;
+            `;
+
+            label = document.createElement('div');
+            label.style.cssText =
+                'font-size:14px;font-weight:600;';
+
+            label.setAttribute('role', 'status');
+            label.setAttribute('aria-live', 'polite');
+
+            action = document.createElement('button');
+            action.type = 'button';
+
+            action.style.cssText = `
+                display:none;
+                margin:12px auto 0;
+                padding:10px 18px;
+                border:0;
+                border-radius:7px;
+                background:white;
+                color:black;
+                font-weight:600;
+                pointer-events:auto;
+                cursor:pointer;
+            `;
+
+            action.addEventListener('click', event => {
+                event.stopPropagation();
+
+                if (!session || !active(session.generation)) {
+                    return;
+                }
+
+                if (
+                    session.phase === 'PAUSED' &&
+                    session.manual
+                ) {
+                    togglePlayPause();
+                    return;
+                }
+
+                if (
+                    session.phase !== 'ERROR' ||
+                    !retryContext
+                ) return;
+
+                const context = { ...retryContext };
+
+                const position = Number.isFinite(session.position)
+                    ? session.position
+                    : context.resume;
+
+                action.disabled = true;
+
+                openEpisodePlayer(
+                    context.slug,
+                    context.season,
+                    context.episode,
+                    position
+                );
+            });
+
+            overlay.append(label, action);
+            container.appendChild(overlay);
+        }
+
+        // Diagnostic dans le panneau Audio / Langues.
+        const settings = document.getElementById(
+            'netflixAudioSubModal'
+        );
+
+        if (!diagnostic && settings) {
+            const button = document.createElement('button');
+
+            button.type = 'button';
+            button.id = 'catPlaybackDiagnosticBtn';
+            button.className = 'netflix-option-row';
+            button.textContent = 'Diagnostic de lecture';
+
+            diagnostic = document.createElement('div');
+            diagnostic.hidden = true;
+
+            diagnostic.style.cssText = `
+                padding:12px;
+                margin-top:8px;
+                font-size:12px;
+                line-height:1.6;
+                white-space:pre-wrap;
+                overflow-wrap:anywhere;
+                color:inherit;
+            `;
+
+            button.addEventListener('click', () => {
+                diagnostic.hidden = !diagnostic.hidden;
+                render(true);
+                resetIdleTimer();
+            });
+
+            settings.append(button, diagnostic);
+        }
+    }
+
+    function render(force = false) {
+        const now = performance.now();
+
+        if (!force && now - lastRender < 750) return;
+
+        lastRender = now;
+
+        createUI();
+
+        const modal = document.getElementById('playerModal');
+        const visible = modal?.classList.contains('open');
+        const valid = session && active(session.generation);
+
+        const phase = valid ? session.phase : 'IDLE';
+
+        const manualPlayback =
+            phase === 'PAUSED' && session?.manual;
+
+        let message = manualPlayback
+            ? 'Appuie sur Lecture pour démarrer'
+            : messages[phase];
+
+        if (overlay) {
+            overlay.style.display =
+                visible && message ? 'block' : 'none';
+
+            if (message && label.textContent !== message) {
+                label.textContent = message;
+            }
+
+            const needsAction =
+                phase === 'ERROR' || manualPlayback;
+
+            action.style.display =
+                needsAction ? 'block' : 'none';
+
+            action.textContent =
+                manualPlayback ? 'Lecture' : 'Réessayer';
+
+            action.disabled = !valid;
+        }
+
+        if (diagnostic && !diagnostic.hidden) {
+            const data = snapshot();
+
+            if (!data || !valid) {
+                diagnostic.textContent = 'Aucune lecture active';
+                return;
+            }
+
+            diagnostic.textContent = [
+                `État : ${data.etat}`,
+                `Moteur : ${data.moteur}`,
+                `Fournisseur : ${data.fournisseur}`,
+                `Tentatives natives : ${data.tentatives}`,
+                `Démarrage : ${
+                    data.demarrageMs === null
+                        ? '—'
+                        : data.demarrageMs + ' ms'
+                }`,
+                `Position : ${data.position} s`,
+                `Tampon : ${
+                    data.tampon === null
+                        ? 'non mesurable'
+                        : data.tampon + ' s'
+                }`,
+                `Ready state : ${data.readyState ?? '—'}`,
+                `Network state : ${data.networkState ?? '—'}`,
+                `Réseau : ${data.reseau}`,
+                `Dernier incident : ${data.incident || 'aucun'}`
+            ].join('\n');
+        }
+    }
+
+    function begin(generation, isActive, context) {
+        guard = isActive;
+        retryContext = { ...context };
+        iframePosition = null;
+
+        session = {
+            generation,
+            phase: 'RESOLVING',
+            mode: null,
+            provider: null,
+            attempts: 0,
+            position: Number.isFinite(context.resume)
+                ? context.resume
+                : null,
+            startedAt: performance.now(),
+            startupMs: null,
+            reason: null,
+            manual: false
+        };
+
+        render(true);
+    }
+
+    function set(generation, phase, patch = {}) {
+        if (!active(generation)) return false;
+
+        const previous = session.phase;
+
+        const next = catPlaybackTransition(
+            session, generation, phase, patch
+        );
+
+        if (!next) return false;
+
+        if (
+            phase === 'PLAYING' &&
+            next.startupMs === null
+        ) {
+            next.startupMs = Math.round(
+                performance.now() - next.startedAt
+            );
+        }
+
+        session = next;
+
+        if (previous !== phase) {
+            console.info(
+                '[Playback State]',
+                previous + ' → ' + phase
+            );
+        }
+
+        render(previous !== phase);
+
+        return true;
+    }
+
+    function context(generation, values) {
+        if (!active(generation)) return;
+
+        retryContext = {
+            ...retryContext,
+            ...values
+        };
+
+        if (Number.isFinite(values.resume)) {
+            session.position = values.resume;
+        }
+    }
+
+    function nativeAttempt(generation) {
+        if (!active(generation)) return;
+
+        set(generation, 'RESOLVING', {
+            mode: 'HTML5 natif',
+            provider: null,
+            attempts: session.attempts + 1,
+            manual: false
+        });
+    }
+
+    function bindNative(video, generation, provider, isActive) {
+        let lastPosition = null;
+
+        set(generation, 'LOADING', {
+            mode: 'HTML5 natif',
+            provider,
+            manual: false
+        });
+
+        function valid() {
+            return active(generation) && isActive();
+        }
+
+        video.addEventListener('playing', () => {
+            if (!valid()) return;
+
+            lastPosition = video.currentTime;
+
+            set(generation, 'PLAYING', {
+                manual: false,
+                position: video.currentTime
+            });
+        });
+
+        video.addEventListener('pause', () => {
+            if (!valid() || video.ended) return;
+
+            lastPosition = null;
+
+            set(generation, 'PAUSED', {
+                position: video.currentTime
+            });
+        });
+
+        video.addEventListener('waiting', () => {
+            if (!valid() || video.paused || video.ended) {
+                return;
+            }
+
+            if (video.readyState < 3) {
+                set(generation, 'BUFFERING');
+            }
+        });
+
+        video.addEventListener('seeking', () => {
+            lastPosition = null;
+        });
+
+        video.addEventListener('seeked', () => {
+            lastPosition = null;
+        });
+
+        video.addEventListener('timeupdate', () => {
+            if (!valid()) return;
+
+            const position = video.currentTime;
+
+            if (!Number.isFinite(position)) return;
+
+            const delta = lastPosition === null
+                ? 0
+                : position - lastPosition;
+
+            lastPosition = position;
+
+            // Ne pas prendre un saut de lecture
+            // pour une preuve de lecture continue.
+            if (
+                !video.paused &&
+                !video.seeking &&
+                video.readyState >= 2 &&
+                delta > 0 &&
+                delta <= 3
+            ) {
+                set(generation, 'PLAYING', {
+                    manual: false,
+                    position
+                });
+            } else if (
+                ['PLAYING', 'PAUSED'].includes(session.phase)
+            ) {
+                set(generation, session.phase, { position });
+            }
+        });
+
+        video.addEventListener('ended', () => {
+            if (!valid()) return;
+
+            set(generation, 'ENDED', {
+                position: video.currentTime
+            });
+        });
+
+        // Un stalled isolé ne change volontairement
+        // jamais l'état de lecture.
+    }
+
+    function observeIframe(position, paused) {
+        if (
+            !session ||
+            !active(session.generation) ||
+            nativeHlsVideo ||
+            !iframePlaybackSession ||
+            session.mode !== 'Iframe' ||
+            !Number.isFinite(position)
+        ) return;
+
+        const generation = session.generation;
+
+        const delta = iframePosition === null
+            ? 0
+            : position - iframePosition;
+
+        iframePosition = position;
+
+        if (paused && session.phase === 'PLAYING') {
+            set(generation, 'PAUSED', { position });
+        } else if (!paused && delta > 0 && delta <= 4) {
+            set(generation, 'PLAYING', { position });
+        }
+    }
+
+    function clear() {
+        session = null;
+        guard = null;
+        retryContext = null;
+        iframePosition = null;
+
+        if (diagnostic) diagnostic.hidden = true;
+
+        render(true);
+    }
+
+    return {
+        begin,
+        set,
+        context,
+        nativeAttempt,
+        bindNative,
+        observeIframe,
+        clear,
+        render,
+        snapshot
+    };
+})();
+
 async function launchNativeHls(options) {
-    const { generation, episode, resumeSeconds, fallback, title, season, version, retryAttempt = 0 } = options;
+    CatPlaybackStatus.nativeAttempt(options.generation);
+    const {
+        generation,
+        episode,
+        resumeSeconds,
+        fallback: originalFallback,
+        title,
+        season,
+        version,
+        retryAttempt = 0
+    } = options;
+
+    const sourceSession =
+        options.catSourceSession ||
+        (options.catSourceSession = {
+            launches: 1,
+            fallbackStarted: false
+        });
+
+    const fallback = position => {
+        if (
+            !isCurrent() ||
+            sourceSession.fallbackStarted
+        ) return;
+
+        sourceSession.fallbackStarted = true;
+
+        console.info(
+            '[Playback Engine] Repli iframe',
+            { launches: sourceSession.launches }
+        );
+
+        return originalFallback(position);
+    };
+
+    const retryNativePlayback = next => {
+        if (
+            !isCurrent() ||
+            sourceSession.fallbackStarted
+        ) return;
+
+        if (!catTakeNativeRetry(sourceSession)) {
+            console.warn(
+                '[Playback Engine] Budget natif épuisé'
+            );
+
+            return fallback(
+                next.resumeSeconds ?? resumeSeconds
+            );
+        }
+
+        console.info(
+            '[Playback Engine] Tentative native',
+            sourceSession.launches + '/4'
+        );
+
+        return launchNativeHls({
+            ...next,
+            catSourceSession: sourceSession
+        });
+    };
+
+    const fetchNativeSource = (input, init = {}) =>
+        catFetchPlaybackJson(
+            input,
+            init,
+            () => isCurrent() &&
+                !sourceSession.fallbackStarted,
+            12000
+        );
 
     const sourceMode =
         options.sourceMode === 'all' ? 'all' : 'primary';
 
-    const sourceIdentity = source =>
-        String(source?.provider || source?.host || '').toLowerCase();
+    const sourceIdentity = catNativeSourceKey;
 
-    const triedProviders = Array.isArray(options.triedProviders)
-        ? options.triedProviders : [];
+    const triedNativeSources = Array.isArray(options.triedNativeSources)
+        ? options.triedNativeSources : [];
 
     const isCurrent = () =>
         generation === nativeHlsGeneration &&
@@ -185,7 +1224,7 @@ async function launchNativeHls(options) {
         if (multiEnabled) {
             if (!Array.isArray(options.nativeSources)) {
                 try {
-                    const response = await fetch(
+                    const response = await fetchNativeSource(
                         '/api/video/sources?' + query +
                             '&mode=' + sourceMode,
                         { cache: 'no-store' }
@@ -202,7 +1241,7 @@ async function launchNativeHls(options) {
                                 typeof source.url === 'string' &&
                                 (
                                     sourceMode !== 'all' ||
-                                    !triedProviders.includes(sourceIdentity(source))
+                                    !triedNativeSources.includes(sourceIdentity(source))
                                 )
                             )
                             : [];
@@ -219,10 +1258,11 @@ async function launchNativeHls(options) {
                                     );
                                 }
                                 return !!capabilities.canPlayType('video/mp4');
-                            })
-                            .sort((a, b) =>
-                                Number(b.health === 'verified') -
-                                Number(a.health === 'verified')
+                            });
+
+                        options.nativeSources =
+                            catRankNativeSources(
+                                options.nativeSources
                             );
 
                         console.info(
@@ -248,7 +1288,7 @@ async function launchNativeHls(options) {
             while (
                 sourceMode === 'all' &&
                 options.nativeSources?.[index] &&
-                triedProviders.includes(
+                triedNativeSources.includes(
                     sourceIdentity(options.nativeSources[index])
                 )
             ) {
@@ -264,8 +1304,13 @@ async function launchNativeHls(options) {
             throw Error('Aucune source alternative');
         }
 
+        if (!media && multiEnabled) {
+            throw Error('Aucune source directe disponible');
+        }
+
         if (!media) {
-            const response = await fetch('/api/video/resolve?' + query);
+            // Compatibilité avec le mode historique uniquement.
+            const response = await fetchNativeSource('/api/video/resolve?' + query);
 
             if (!response.ok) {
                 throw Error('Résolution HTTP ' + response.status);
@@ -278,8 +1323,8 @@ async function launchNativeHls(options) {
 
         if (multiEnabled) {
             const identity = sourceIdentity(media);
-            if (identity && !triedProviders.includes(identity)) {
-                options.triedProviders = [...triedProviders, identity];
+            if (identity && !triedNativeSources.includes(identity)) {
+                options.triedNativeSources = [...triedNativeSources, identity];
             }
         }
 
@@ -327,6 +1372,73 @@ async function launchNativeHls(options) {
             'pointer-events:none'
         ].join(';');
 
+
+        let sourceSuccessRecorded = false;
+        let sourcePlayedSeconds = 0;
+        let sourceLastPosition = null;
+
+        function resetSourceSample() {
+            sourceLastPosition = null;
+        }
+
+        video.addEventListener(
+            'seeking', resetSourceSample
+        );
+
+        video.addEventListener(
+            'seeked', resetSourceSample
+        );
+
+        video.addEventListener(
+            'pause', resetSourceSample
+        );
+
+        video.addEventListener('timeupdate', () => {
+            if (
+                sourceSuccessRecorded ||
+                nativeHlsVideo !== video ||
+                !isCurrent()
+            ) return;
+
+            if (
+                video.paused ||
+                video.seeking ||
+                video.readyState < 2 ||
+                document.visibilityState !== 'visible'
+            ) {
+                resetSourceSample();
+                return;
+            }
+
+            const position = video.currentTime;
+
+            if (!Number.isFinite(position)) return;
+
+            if (sourceLastPosition !== null) {
+                const delta =
+                    position - sourceLastPosition;
+
+                // Ignorer les déplacements importants
+                // de la position de lecture.
+                if (delta > 0 && delta <= 2.5) {
+                    sourcePlayedSeconds += delta;
+                }
+            }
+
+            sourceLastPosition = position;
+
+            if (sourcePlayedSeconds >= 2) {
+                sourceSuccessRecorded = true;
+
+                catRememberSourceOutcome(media, true);
+
+                console.info(
+                    '[Source Manager] Lecture confirmée',
+                    catNativeProviderKey(media)
+                );
+            }
+        });
+
         video.addEventListener('loadedmetadata', () => {
             if (nativeHlsVideo !== video) return;
 
@@ -366,8 +1478,50 @@ async function launchNativeHls(options) {
             changeEpisode(1);
         });
 
-        video.addEventListener('error', () => {
-            if (nativeHlsVideo !== video || !isCurrent()) return;
+        const watchdogBudget =
+            options.watchdogBudget ||
+            (options.watchdogBudget = { attempts: 0 });
+
+        let recoveryStarted = false;
+
+        const recoverNativePlayback = (
+            reason = 'media-error'
+        ) => {
+            if (
+                recoveryStarted ||
+                nativeHlsVideo !== video ||
+                !isCurrent()
+            ) return;
+
+            recoveryStarted = true;
+
+            CatPlaybackStatus.set(
+                generation,
+                'RECOVERING',
+                {
+                    reason,
+                    position: Number.isFinite(video.currentTime)
+                        ? video.currentTime
+                        : resumeSeconds
+                }
+            );
+
+            if (
+                navigator.onLine !== false &&
+                document.visibilityState === 'visible'
+            ) {
+                catRememberSourceOutcome(media, false);
+
+                console.info(
+                    '[Source Manager] Incident enregistré',
+                    catNativeProviderKey(media)
+                );
+            }
+
+            console.warn(
+                '[Native HLS] Récupération',
+                reason
+            );
 
             const position = (
                 Number.isFinite(video.currentTime) &&
@@ -379,6 +1533,19 @@ async function launchNativeHls(options) {
             saveNativeHlsProgress(true);
             stopNativeHls(false);
 
+            if (reason.startsWith('watchdog:')) {
+                if (watchdogBudget.attempts >= 2) {
+                    console.warn(
+                        '[Playback Watchdog] Budget épuisé'
+                    );
+
+                    fallback(position);
+                    return;
+                }
+
+                watchdogBudget.attempts += 1;
+            }
+
             if (
                 multiEnabled &&
                 sourceMode === 'primary' &&
@@ -386,7 +1553,7 @@ async function launchNativeHls(options) {
             ) {
                 console.warn('[Native HLS] Recherche des sources alternatives');
 
-                launchNativeHls({
+                retryNativePlayback({
                     ...options,
                     sourceMode: 'all',
                     nativeSources: null,
@@ -410,7 +1577,7 @@ async function launchNativeHls(options) {
                     options.nativeSources.length
                 );
 
-                launchNativeHls({
+                retryNativePlayback({
                     ...options,
                     nativeSourceIndex: nextIndex,
                     resumeSeconds: position
@@ -421,7 +1588,7 @@ async function launchNativeHls(options) {
             if (retryAttempt < 1) {
                 console.warn('[Native HLS] Erreur média, nouvelle résolution');
 
-                launchNativeHls({
+                retryNativePlayback({
                     ...options,
                     sourceMode: 'primary',
                     nativeSources: null,
@@ -434,10 +1601,29 @@ async function launchNativeHls(options) {
 
             console.warn('[Native HLS] Nouvelle tentative échouée, repli iframe');
             fallback(position);
+        };
+
+        video.addEventListener('error', () => {
+            recoverNativePlayback('media-error');
         });
 
         nativeHlsVideo = video;
         nativeHlsLastSave = 0;
+
+        CatPlaybackStatus.bindNative(
+            video,
+            generation,
+            catNativeProviderKey(media),
+            () => nativeHlsVideo === video &&
+                isCurrent() &&
+                !recoveryStarted
+        );
+
+        catStartNativeWatchdog(
+            video,
+            () => nativeHlsVideo === video && isCurrent(),
+            recoverNativePlayback
+        );
 
         viewport.prepend(video);
         video.src = toProxyUrl(media.url);
@@ -447,11 +1633,57 @@ async function launchNativeHls(options) {
         syncPlayerMediaMetadata();
 
         video.play().catch(error => {
-            if (!isCurrent() || nativeHlsVideo !== video) return;
+            if (
+                !isCurrent() ||
+                nativeHlsVideo !== video ||
+                recoveryStarted
+            ) return;
+
             if (error.name === 'NotAllowedError') {
-                console.info('[Native HLS] Cliquer sur Lecture');
-            } else {
-                console.warn('[Native HLS] Lecture :', error.name);
+                CatPlaybackStatus.set(
+                    generation,
+                    'PAUSED',
+                    { manual: true }
+                );
+                console.info(
+                    '[Playback Engine] Lecture manuelle requise'
+                );
+
+                updateFromVideoElement(video);
+                resetIdleTimer();
+
+                showToast(
+                    'Appuie sur Lecture pour démarrer la vidéo'
+                );
+
+                return;
+            }
+
+            // Une interruption normale du navigateur
+            // ne doit pas relancer le moteur.
+            if (error.name === 'AbortError') {
+                console.info(
+                    '[Playback Engine] Lecture interrompue'
+                );
+                return;
+            }
+
+            console.warn(
+                '[Playback Engine] Erreur play()',
+                error.name
+            );
+
+            if (
+                video.error ||
+                [
+                    'NotSupportedError',
+                    'NetworkError',
+                    'EncodingError'
+                ].includes(error.name)
+            ) {
+                recoverNativePlayback(
+                    'play-error:' + error.name
+                );
             }
         });
 
@@ -467,7 +1699,7 @@ async function launchNativeHls(options) {
         ) {
             console.warn('[Native HLS] Recherche des sources alternatives');
 
-            launchNativeHls({
+            retryNativePlayback({
                 ...options,
                 sourceMode: 'all',
                 nativeSources: null,
@@ -483,7 +1715,7 @@ async function launchNativeHls(options) {
             Array.isArray(options.nativeSources) &&
             nextIndex < options.nativeSources.length
         ) {
-            launchNativeHls({
+            retryNativePlayback({
                 ...options,
                 nativeSourceIndex: nextIndex
             });
@@ -491,7 +1723,7 @@ async function launchNativeHls(options) {
         }
 
         if (multiEnabled && retryAttempt < 1) {
-            launchNativeHls({
+            retryNativePlayback({
                 ...options,
                 sourceMode: 'primary',
                 nativeSources: null,
@@ -1098,6 +2330,17 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
         );
     };
 
+    CatPlaybackStatus.begin(
+        nativeGeneration,
+        isOpeningCurrent,
+        {
+            slug,
+            season: seasonPath,
+            episode: episodeIndex,
+            resume: resumeSeconds
+        }
+    );
+
     stopNativeHls();
     if (typeof unDismissContinue === 'function') {
         unDismissContinue(slug);
@@ -1149,6 +2392,7 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
         }
 
         if (isScanSeason(normalizedSeason)) {
+            CatPlaybackStatus.clear();
             openScanViewer(slug, normalizedSeason, episodeIndex);
             return;
         }
@@ -1194,7 +2438,7 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
 
         const urls =
             State.currentEpisodes.players[State.selectedPlayer] || [];
-        const videoUrl = urls[episodeIndex];
+        let videoUrl = urls[episodeIndex];
 
         if (!videoUrl) {
             showToast(t('player.link_unavailable', "Lien d'épisode indisponible"));
@@ -1228,6 +2472,15 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
             }
         }
 
+        CatPlaybackStatus.context(
+            nativeGeneration,
+            {
+                season: normalizedSeason,
+                episode: episodeIndex,
+                resume: resumeSeconds
+            }
+        );
+
         State.targetResumeTime = resumeSeconds > 5 ? resumeSeconds : 0;
         State.currentEpIndex = episodeIndex;
         State.lastCurrentTime = resumeSeconds || 0;
@@ -1260,18 +2513,18 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
             localStorage.setItem('as_last_selected_lang', State.selectedLanguage);
         } catch (e) {}
 
-        let proxyUrl = toProxyUrl(videoUrl);
-        if (!proxyUrl) {
-            showToast(t('player.launch_error', 'Impossible de lancer le lecteur'));
-            return;
-        }
-        const sep = proxyUrl.includes('?') ? '&' : '?';
-        const qParams = [];
-        if (resumeSeconds > 0) {
-            qParams.push(`as_resume=${Math.floor(resumeSeconds)}`);
-        }
-        qParams.push(`as_ep=${episodeIndex + 1}`);
-        proxyUrl += `${sep}${qParams.join('&')}`;
+
+        // Cataclyse 12.0.3 : résolution iframe différée.
+        const fallbackSeason = State.currentEpisodes.season;
+
+        const fallbackCandidates = [
+            ...new Set([State.selectedPlayer, ...eligiblePlayers])
+        ].filter(Boolean).map(name => ({
+            name,
+            url: State.currentEpisodes.players[name]?.[episodeIndex]
+        }));
+
+        let iframeStartPending = false;
 
         const iframe = document.getElementById('videoIframe');
 
@@ -1294,8 +2547,148 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
             }
         })();
 
-        const startIframePlayback = (resumeAt = resumeSeconds) => {
+        const startIframePlaybackImpl = async (resumeAt = resumeSeconds) => {
+            if (!isOpeningCurrent() || !iframe) return;
+
+            let proxyUrl = null;
+            let provider = null;
+
+            for (const candidate of fallbackCandidates) {
+                if (!isOpeningCurrent()) return;
+                if (triedPlayers.has(candidate.name)) continue;
+
+                try {
+                    let url = candidate.url;
+
+                    if (typeof url !== 'string' || !url.trim()) {
+                        throw new Error('Lien absent');
+                    }
+
+                    if (url.startsWith('lien:')) {
+                        const id = url.slice(5);
+
+                        if (!/^[0-9]{1,20}$/.test(id)) {
+                            throw new Error('Référence invalide');
+                        }
+
+                        const params = new URLSearchParams({
+                            slug,
+                            season: fallbackSeason,
+                            l: id
+                        });
+
+                        const controller = new AbortController();
+
+                        const timer = setTimeout(
+                            () => controller.abort(),
+                            10000
+                        );
+
+                        try {
+                            console.info(
+                                '[Playback Engine] Résolution iframe',
+                                candidate.name
+                            );
+
+                            const response = await fetch(
+                                '/api/lien?' + params.toString(),
+                                {
+                                    cache: 'no-store',
+                                    signal: controller.signal
+                                }
+                            );
+
+                            if (!isOpeningCurrent()) return;
+
+                            if (!response.ok) {
+                                const failure = new Error('HTTP');
+                                failure.httpStatus = response.status;
+                                throw failure;
+                            }
+
+                            const data = await response.json();
+
+                            if (!isOpeningCurrent()) return;
+
+                            if (
+                                typeof data.u !== 'string' ||
+                                !data.u.startsWith('https://')
+                            ) {
+                                throw new Error('URL invalide');
+                            }
+
+                            url = data.u;
+
+                        } finally {
+                            clearTimeout(timer);
+                        }
+                    }
+
+                    proxyUrl = toProxyUrl(url);
+
+                    if (
+                        typeof proxyUrl !== 'string' ||
+                        !proxyUrl
+                    ) {
+                        throw new Error('Proxy indisponible');
+                    }
+
+                    provider = candidate.name;
+                    break;
+
+                } catch (error) {
+                    if (!isOpeningCurrent()) return;
+
+                    triedPlayers.add(candidate.name);
+                    proxyUrl = null;
+
+                    console.warn(
+                        '[Playback Engine] Lecteur écarté',
+                        candidate.name,
+                        error.httpStatus || error.name
+                    );
+                }
+            }
+
             if (!isOpeningCurrent()) return;
+
+            if (!proxyUrl || !provider) {
+                console.warn(
+                    '[Playback Engine] Aucun iframe disponible'
+                );
+
+                CatPlaybackStatus.set(
+                    nativeGeneration,
+                    'ERROR',
+                    { reason: 'no-fallback-source' }
+                );
+
+                showToast(
+                    'Aucune source vidéo de secours disponible'
+                );
+
+                return;
+            }
+
+            State.selectedPlayer = provider;
+
+            CatPlaybackStatus.set(
+                nativeGeneration,
+                'LOADING',
+                {
+                    mode: 'Iframe',
+                    provider
+                }
+            );
+
+            if (currentServerEl) {
+                currentServerEl.textContent = provider;
+            }
+
+            console.info(
+                '[Playback Engine] Secours iframe sélectionné',
+                provider
+            );
 
             const token = createIframePlaybackSession();
 
@@ -1313,6 +2706,19 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
             const targetResume = (
                 Number.isFinite(resumeAt) && resumeAt >= 0
             ) ? resumeAt : 0;
+
+            const sep = proxyUrl.includes('?') ? '&' : '?';
+            const qParams = [];
+
+            if (targetResume > 0) {
+                qParams.push(
+                    `as_resume=${Math.floor(targetResume)}`
+                );
+            }
+
+            qParams.push(`as_ep=${episodeIndex + 1}`);
+            proxyUrl += sep + qParams.join('&');
+
 
             const stillCurrent = () =>
                 nativeGeneration === nativeHlsGeneration &&
@@ -1355,25 +2761,71 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
                     season: normalizedSeason,
                     episodeIndex,
                     provider: State.selectedPlayer,
-                    triedPlayers: recovery?.triedPlayers || [],
+                    triedPlayers: [...triedPlayers],
                     resumeSeconds: targetResume
                 });
             }
 
         };
 
-        if (useNativeHls) {
-            if (iframe) {
-                iframe.onload = null;
-                iframe.src = 'about:blank';
-                iframe.style.display = 'none';
-            }
-        } else {
-            startIframePlayback();
+        const startIframePlayback = (resumeAt = resumeSeconds) => {
+            if (
+                !isOpeningCurrent() ||
+                iframeStartPending ||
+                iframePlaybackSession
+            ) return;
+
+            iframeStartPending = true;
+
+            CatPlaybackStatus.set(
+                nativeGeneration,
+                'FALLBACK',
+                {
+                    mode: 'Iframe',
+                    provider: null,
+                    manual: false
+                }
+            );
+
+            return startIframePlaybackImpl(resumeAt)
+                .catch(error => {
+                    if (!isOpeningCurrent()) return;
+
+                    console.warn(
+                        '[Playback Engine] Incident iframe',
+                        error.name
+                    );
+
+                    CatPlaybackStatus.set(
+                        nativeGeneration,
+                        'ERROR',
+                        { reason: 'iframe-start-failed' }
+                    );
+
+                    showToast('Lecteur vidéo indisponible');
+                })
+                .finally(() => {
+                    iframeStartPending = false;
+                });
+        };
+
+        // Neutraliser l'ancien iframe avant toute nouvelle lecture.
+        if (iframe) {
+            iframe.onload = null;
+            iframe.src = 'about:blank';
+            iframe.style.display = 'none';
         }
 
         const modal = document.getElementById('playerModal');
         if (modal) modal.classList.add('open');
+
+        CatPlaybackStatus.render(true);
+
+        // Le lecteur natif est lancé plus bas par le code existant.
+        // L'iframe n'est résolu que lorsque nécessaire.
+        if (!useNativeHls) {
+            startIframePlayback();
+        }
         document.body.style.overflow = 'hidden';
 
         let savedFilter = 'normal';
@@ -1437,6 +2889,14 @@ async function openEpisodePlayer(slug, seasonPath, episodeIndex, resumeSeconds, 
             });
         }
     } catch (e) {
+        if (!isOpeningCurrent()) return;
+
+        CatPlaybackStatus.set(
+            nativeGeneration,
+            'ERROR',
+            { reason: 'episode-opening-failed' }
+        );
+
         console.error('Erreur lecture vidéo:', e);
         showToast('Impossible de lancer le lecteur');
     }
@@ -1536,10 +2996,17 @@ function updateFromVideoElement(v) {
 function syncPlaybackState(currentTime, duration, bufferedEnd, paused, volume, muted) {
     const modal = document.getElementById('playerModal');
     if (!modal || !modal.classList.contains('open')) return;
+    CatPlaybackStatus.observeIframe(
+        currentTime,
+        paused
+    );
+
     playerState.currentTime = currentTime;
     if (duration > 0) playerState.duration = duration;
     playerState.bufferedEnd = bufferedEnd;
+    const wasPaused = playerState.paused;
     playerState.paused = paused;
+    if (paused && !wasPaused) resetIdleTimer();
     if (volume !== undefined) playerState.volume = volume;
     if (muted !== undefined) playerState.muted = muted;
 
@@ -1565,8 +3032,16 @@ function renderScrubber(currentTime, duration, bufferedEnd) {
     const pct = Math.max(0, Math.min(100, (currentTime / duration) * 100));
     playedBar.style.width = `${pct}%`;
 
-    if (bufferedBar && bufferedEnd > 0) {
-        const bufPct = Math.max(0, Math.min(100, (bufferedEnd / duration) * 100));
+    if (bufferedBar) {
+        const end = Number.isFinite(bufferedEnd)
+            ? Math.max(0, bufferedEnd)
+            : 0;
+
+        const bufPct = Math.max(
+            0,
+            Math.min(100, (end / duration) * 100)
+        );
+
         bufferedBar.style.width = `${bufPct}%`;
     }
 }
@@ -2008,12 +3483,39 @@ function checkNextEpisodePrompt(currentTime, duration) {
         const timerEl = document.getElementById('netflixNextPromptTimer');
         if (timerEl) timerEl.textContent = `${countdown}s`;
 
+        const expectedSlug = State.currentEpisodes?.slug;
+        const expectedSeason = State.currentEpisodes?.season;
+        const expectedEpisode = State.currentEpIndex;
+
         clearInterval(playerState.nextCountdownTimer);
         playerState.nextCountdownTimer = setInterval(() => {
+            const modal = document.getElementById('playerModal');
+
+            const stillCurrent =
+                modal?.classList.contains('open') &&
+                State.currentEpisodes?.slug === expectedSlug &&
+                State.currentEpisodes?.season === expectedSeason &&
+                State.currentEpIndex === expectedEpisode;
+
+            if (!stillCurrent) {
+                clearInterval(playerState.nextCountdownTimer);
+                playerState.nextCountdownTimer = null;
+                return;
+            }
+
+            if (
+                document.visibilityState !== 'visible' ||
+                playerState.paused
+            ) {
+                return;
+            }
+
             countdown -= 1;
             if (timerEl) timerEl.textContent = `${countdown}s`;
+
             if (countdown <= 0) {
                 clearInterval(playerState.nextCountdownTimer);
+                playerState.nextCountdownTimer = null;
                 prompt.style.display = 'none';
                 changeEpisode(1);
             }
@@ -2270,10 +3772,18 @@ function resetIdleTimer() {
             const audioModal = document.getElementById('netflixAudioSubModal');
             const drawer = document.getElementById('netflixEpisodesDrawer');
             const speedMenu = document.getElementById('netflixSpeedMenu');
+            const filterMenu = document.getElementById('netflixFilterMenu');
+            const nextPrompt = document.getElementById('netflixNextPrompt');
 
-            const isAnyOpen = (audioModal && audioModal.style.display !== 'none') ||
-                (drawer && drawer.style.display !== 'none') ||
-                (speedMenu && speedMenu.style.display !== 'none');
+            const isVisible = el =>
+                !!el && getComputedStyle(el).display !== 'none';
+
+            const isAnyOpen =
+                isVisible(audioModal) ||
+                isVisible(drawer) ||
+                isVisible(speedMenu) ||
+                isVisible(filterMenu) ||
+                isVisible(nextPrompt);
 
             if (!isAnyOpen && !playerState.paused && !playerState.isDraggingScrubber) {
                 container.classList.add('idle');
@@ -2379,6 +3889,8 @@ function changeEpisode(delta) {
 
 function closePlayerModal(saveProgress = true) {
     ++nativeHlsGeneration;
+
+    CatPlaybackStatus.clear();
     stopIframeRecoveryMonitor();
 
     iframePlaybackSession = null;
@@ -2405,6 +3917,16 @@ function closePlayerModal(saveProgress = true) {
     stopDynamicFilter();
     if (saveProgress) flushCurrentPlayback();
     clearInterval(playerState.nextCountdownTimer);
+    playerState.nextCountdownTimer = null;
+
+    clearTimeout(playerState.idleTimer);
+    playerState.idleTimer = null;
+
+    clearTimeout(playerState.clickTimeout);
+    playerState.clickTimeout = null;
+
+    document.getElementById('netflixPlayerContainer')
+        ?.classList.remove('idle');
 
     const modal = document.getElementById('playerModal');
     if (modal) modal.classList.remove('open');
@@ -2610,7 +4132,7 @@ function initNetflixPlayerEvents() {
         } else if (ev.data.type === 'AS_PLAY_STATE') {
             playerState.paused = !!ev.data.paused;
             updatePlayPauseButton(!playerState.paused);
-            if (!playerState.paused) resetIdleTimer();
+            resetIdleTimer();
         } else if (ev.data.type === 'AS_WAITING') {
             const spinner = document.getElementById('netflixSpinner');
             if (spinner) spinner.style.display = ev.data.waiting ? 'block' : 'none';

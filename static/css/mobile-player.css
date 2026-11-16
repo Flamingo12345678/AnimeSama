@@ -151,3 +151,238 @@
     pointer-events: none;
   }
 }
+
+
+/* Cataclyse 11L.1 — UI cinéma iPhone */
+
+/* Panneaux toujours au-dessus des commandes. */
+@media (max-width: 640px) {
+  #playerModal .netflix-audio-sub-modal,
+  #playerModal .netflix-episodes-drawer {
+    box-sizing: border-box;
+    left: 12px;
+    right: 12px;
+    bottom: calc(125px + env(safe-area-inset-bottom, 0px));
+    width: auto;
+    max-width: none;
+    max-height: 50dvh;
+    overflow-y: auto;
+    overscroll-behavior: contain;
+    -webkit-overflow-scrolling: touch;
+    z-index: 70;
+    border-radius: 14px;
+  }
+
+  #playerModal .netflix-audio-sub-columns {
+    grid-template-columns: minmax(0, 1fr);
+  }
+
+  #playerModal .netflix-drawer-grid {
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    max-height: 32dvh;
+  }
+
+  #playerModal .netflix-audio-col,
+  #playerModal .netflix-drawer-title-group {
+    min-width: 0;
+  }
+
+  /* Rotation visuelle quand iOS reste en portrait. */
+  #playerModal.open.cat-cinema-rotated {
+    position: fixed !important;
+    top: 0 !important;
+    left: 100dvw !important;
+    right: auto !important;
+    bottom: auto !important;
+    width: 100dvh !important;
+    height: 100dvw !important;
+    max-width: none !important;
+    max-height: none !important;
+    transform-origin: top left !important;
+    transform: rotate(90deg) !important;
+    overflow: hidden !important;
+  }
+
+  #playerModal.cat-cinema-rotated
+  .netflix-player-container {
+    width: 100%;
+    height: 100%;
+  }
+
+  #playerModal.cat-cinema-rotated .netflix-top-bar {
+    min-height: 0;
+    height: 62px;
+    padding: 10px 20px 0;
+  }
+
+  #playerModal.cat-cinema-rotated .netflix-bottom-bar {
+    padding: 14px 22px 12px;
+    gap: 6px;
+  }
+
+  #playerModal.cat-cinema-rotated .netflix-controls-row {
+    flex-direction: row;
+    align-items: center;
+    gap: 8px;
+  }
+
+  #playerModal.cat-cinema-rotated .netflix-ctrl-group {
+    flex: 0 1 auto;
+    width: auto;
+    min-width: 0;
+    gap: 3px;
+  }
+
+  #playerModal.cat-cinema-rotated .netflix-ctrl-btn {
+    min-width: 35px;
+    min-height: 39px;
+  }
+
+  #playerModal.cat-cinema-rotated
+  .netflix-audio-sub-modal,
+  #playerModal.cat-cinema-rotated
+  .netflix-episodes-drawer {
+    left: auto;
+    right: 18px;
+    bottom: 103px;
+    width: min(420px, calc(100dvh - 36px));
+    max-height: calc(100dvw - 125px);
+    padding: 12px;
+  }
+
+  #playerModal.cat-cinema-rotated
+  .netflix-drawer-grid {
+    grid-template-columns: repeat(6, minmax(0, 1fr));
+    max-height: 130px;
+  }
+
+  #playerModal.cat-cinema-rotated
+  #netflixFullscreenBtn .icon-expand {
+    display: none !important;
+  }
+
+  #playerModal.cat-cinema-rotated
+  #netflixFullscreenBtn .icon-compress {
+    display: block !important;
+  }
+}
+
+/* Paysage réel : iOS a autorisé la rotation. */
+@media (orientation: landscape) and (max-height: 600px) and (pointer: coarse) {
+  #playerModal {
+    width: 100vw;
+    height: 100dvh;
+  }
+
+  #playerModal .netflix-top-bar {
+    height: 60px;
+    padding: 8px 24px 0;
+  }
+
+  #playerModal .netflix-bottom-bar {
+    padding: 12px 24px
+      calc(10px + env(safe-area-inset-bottom, 0px));
+  }
+
+  #playerModal .netflix-controls-row {
+    flex-direction: row;
+    align-items: center;
+  }
+
+  #playerModal .netflix-ctrl-group {
+    width: auto;
+    gap: 4px;
+  }
+
+  #playerModal .netflix-audio-sub-modal,
+  #playerModal .netflix-episodes-drawer {
+    box-sizing: border-box;
+    left: auto;
+    right: calc(16px + env(safe-area-inset-right, 0px));
+    bottom: 95px;
+    width: min(440px, 70vw);
+    max-height: calc(100dvh - 110px);
+    overflow-y: auto;
+    z-index: 70;
+  }
+}
+
+
+/* Cataclyse 11L.2 : rotation et ratio cinéma iPhone */
+
+#playerModal #catCinemaFitBtn {
+    display: none;
+    font-size: 12px;
+    font-weight: 700;
+    white-space: nowrap;
+    min-width: 58px;
+}
+
+#playerModal.cat-cinema-rotated #catCinemaFitBtn {
+    display: inline-flex;
+}
+
+#playerModal.cat-video-fill #catCinemaFitBtn {
+    color: #e50914;
+}
+
+#playerModal.cat-video-fill .netflix-video-viewport {
+    overflow: hidden;
+}
+
+/* Vidéo HTML5 native : véritable object-fit cover. */
+#playerModal.cat-cinema-rotated.cat-video-fill
+.netflix-video-viewport video {
+    width: 100% !important;
+    height: 100% !important;
+    object-fit: cover !important;
+}
+
+/*
+ * Iframe : cadrage 16:9 avec rognage extérieur.
+ * Le contenu interne d'un iframe tiers reste indépendant.
+ */
+@media screen and (max-width: 640px)
+       and (orientation: portrait) {
+
+    #playerModal.cat-cinema-rotated.cat-video-fill
+    .netflix-video-viewport iframe {
+        position: absolute !important;
+        left: 50% !important;
+        top: 50% !important;
+        width: max(100%, 177.7778dvw) !important;
+        height: max(100%, 56.25dvh) !important;
+        max-width: none !important;
+        max-height: none !important;
+        transform: translate(-50%, -50%) !important;
+    }
+}
+
+/* Paysage réellement autorisé par iOS. */
+@media screen and (orientation: landscape)
+       and (max-height: 600px)
+       and (pointer: coarse) {
+
+    #playerModal.open #catCinemaFitBtn {
+        display: inline-flex;
+    }
+
+    #playerModal.cat-video-fill
+    .netflix-video-viewport video {
+        width: 100% !important;
+        height: 100% !important;
+        object-fit: cover !important;
+    }
+
+    #playerModal.cat-video-fill
+    .netflix-video-viewport iframe {
+        position: absolute !important;
+        left: 50% !important;
+        top: 50% !important;
+        width: max(100%, 177.7778dvh) !important;
+        height: max(100%, 56.25dvw) !important;
+        max-width: none !important;
+        max-height: none !important;
+        transform: translate(-50%, -50%) !important;
+    }
+}
